@@ -20,6 +20,8 @@ from .models import (
 )
 from .repository import InMemoryRepository
 
+LATE_FEE_GRACE_DAYS = 5
+
 
 class BillingService:
     """Application service for the BrewBox subscription billing assessment.
@@ -245,7 +247,9 @@ class BillingService:
             return invoice
         if invoice.amount_due <= 0:
             return invoice
-        if day < invoice.due_on + timedelta(days=5):
+        # Five full calendar days of grace: due date + 5 is still on time, the
+        # fee starts on due date + 6.
+        if day < invoice.due_on + timedelta(days=LATE_FEE_GRACE_DAYS + 1):
             return invoice
         if invoice.late_fee > 0:
             return invoice
