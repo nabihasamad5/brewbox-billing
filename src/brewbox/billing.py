@@ -21,6 +21,8 @@ from .models import (
 from .repository import InMemoryRepository
 
 LATE_FEE_GRACE_DAYS = 5
+MIN_PAUSE_DAYS = 7
+MAX_PAUSE_DAYS = 90
 
 
 class BillingService:
@@ -275,13 +277,58 @@ class BillingService:
         end: date,
         as_of: date | None = None,
     ) -> PausePeriod:
-        raise NotImplementedError("FEAT-201: pause and resume are not implemented")
+        """Schedule a pause from ``start`` to ``end``, both dates inclusive.
+
+        ``as_of`` is "today" for the overdue-invoice check (defaults to the
+        service clock). Invalid requests raise ``ValueError``; nothing is clamped.
+        """
+        subscription = self._subscription(subscription_id)
+        if subscription.cancelled_on is not None:
+            raise ValueError("a cancelled subscription cannot be paused")
+        if start > end:
+            raise ValueError("pause start must not be after pause end")
+
+        pause = PausePeriod(start, end)
+        if not MIN_PAUSE_DAYS <= pause.days <= MAX_PAUSE_DAYS:
+            raise ValueError(
+                f"pause must be between {MIN_PAUSE_DAYS} and {MAX_PAUSE_DAYS} days "
+                f"(got {pause.days})"
+            )
+        if start < subscription.start_date:
+            raise ValueError("pause cannot start before the subscription start date")
+        if any(pause.overlaps(existing) for existing in subscription.pauses):
+            raise ValueError("pause overlaps an existing pause")
+
+        today = as_of or self._today()
+        if self._has_overdue_invoice(subscription.customer_id, today):
+            raise ValueError("settle overdue invoices before pausing")
+
+        subscription.pauses.append(pause)
+        subscription.pauses.sort(key=lambda p: p.start)
+        return pause
 
     def resume_subscription(self, subscription_id: str, on: date) -> PausePeriod:
-        raise NotImplementedError("FEAT-201: pause and resume are not implemented")
+        """Resume early: ``on`` becomes the first active day again.
+
+        The pause containing ``on`` ends the day before; the shortened pause
+        must still be at least the minimum length.
+        """
+        subscription = self._subscription(subscription_id)
+        for index, pause in enumerate(subscription.pauses):
+            if pause.start <= on <= pause.end:
+                shortened = PausePeriod(pause.start, on - timedelta(days=1))
+                if shortened.days < MIN_PAUSE_DAYS:
+                    raise ValueError(
+                        f"a pause must last at least {MIN_PAUSE_DAYS} days; "
+                        f"resuming on {on} would leave {max(shortened.days, 0)}"
+                    )
+                subscription.pauses[index] = shortened
+                return shortened
+        raise ValueError("no pause is in effect on that date")
 
     def list_pauses(self, subscription_id: str) -> list[PausePeriod]:
-        raise NotImplementedError("FEAT-201: pause and resume are not implemented")
+        """Pause windows for support/audit, oldest first (a copy)."""
+        return sorted(self._subscription(subscription_id).pauses, key=lambda p: p.start)
 
     # ------------------------------------------------------------------
     # Internals
@@ -312,6 +359,21 @@ class BillingService:
             raise ValueError(f"discount cannot exceed {MAX_DISCOUNT_PERCENT}%")
         return discount
 
+    def _subscription(self, subscription_id: str) -> Subscription:
+        subscription = self.repo.subscriptions.get(subscription_id)
+        if subscription is None:
+            raise ValueError("subscription does not exist")
+        return subscription
+
+    def _has_overdue_invoice(self, customer_id: str, today: date) -> bool:
+        """Overdue = due date strictly before today and a positive balance."""
+        return any(
+            invoice.status == InvoiceStatus.ISSUED
+            and invoice.due_on < today
+            and invoice.amount_due > 0
+            for invoice in self.repo.invoices_for_customer(customer_id)
+        )
+
     def _invoice(self, invoice_id: str) -> Invoice:
         invoice = self.repo.invoices.get(invoice_id)
         if invoice is None:
@@ -327,11 +389,21 @@ class BillingService:
     def _active_days(
         subscription: Subscription, period_start: date, period_end: date
     ) -> int:
+        """Billable days in the period: from the start date to period end,
+        inclusive, minus any paused days that fall inside that range.
+        """
         start = max(period_start, subscription.start_date)
         end = period_end
         if start > end:
             return 0
-        return (end - start).days + 1
+        active = (end - start).days + 1
+        # Pauses never overlap (enforced on creation), so overlaps can be summed.
+        for pause in subscription.pauses:
+            overlap_start = max(start, pause.start)
+            overlap_end = min(end, pause.end)
+            if overlap_start <= overlap_end:
+                active -= (overlap_end - overlap_start).days + 1
+        return active
 
     def _find_invoice(
         self, subscription_id: str, year: int, month: int
